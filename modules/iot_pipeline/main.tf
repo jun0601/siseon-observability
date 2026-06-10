@@ -80,7 +80,7 @@ resource "aws_glue_catalog_table" "sensor_data" {
     }
     columns {
       name = "timestamp"
-      type = "string"
+      type = "timestamp"
     }
     columns {
       name = "sequence_id"
