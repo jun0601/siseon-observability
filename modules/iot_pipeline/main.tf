@@ -7,6 +7,7 @@ resource "aws_s3_bucket" "query_results" {
 # Athena 워크그룹
 resource "aws_athena_workgroup" "sensor" {
   name = var.athena_workgroup_name
+  force_destroy = true
 
   configuration {
     result_configuration {
