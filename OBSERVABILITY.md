@@ -1,8 +1,10 @@
-# 🌡️ StockOps IoT 관측 파이프라인 설계 문서
+# 🌡️ StockOps 관측 파이프라인 설계 문서
 
-> S3에 적재된 IoT 센서 데이터를 Glue 카탈로그 + Athena 파티션 프로젝션으로 쿼리 가능하게 만드는 설계 문서
+> IoT 센서 데이터(Glue/Athena)와 애플리케이션 로그(Fluent Bit/CloudWatch) 수집·적재 설계 문서
 
 ---
+
+# 1부. IoT 센서 파이프라인
 
 ## 🏗️ 전체 아키텍처
 
@@ -161,40 +163,80 @@ WHERE sensor_type = 'temperature'
 ORDER BY time
 ```
 
-### 센서 종류별 최신값
-
-```sql
-SELECT sensor_type, value, timestamp
-FROM stockops_sensor.sensor_data
-WHERE year = '2026' AND month = '06' AND day = '10'
-ORDER BY timestamp DESC
-```
-
 > Grafana 패널에서는 `time` alias가 필수다. Athena 플러그인이 시계열 컬럼을 `time` 이름으로 인식한다.
 
 ---
 
-## 🔐 Grafana ↔ Athena 권한 (IRSA)
+# 2부. 애플리케이션 로그 파이프라인
 
-Grafana가 Athena를 호출하려면 IAM 권한이 필요하다. **EKS Node Role이 아닌 Grafana ServiceAccount에 IRSA로 직접 Role을 연결**했다. (Node Role 방식은 IMDS 자격증명 조회 실패 — [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) #4)
+## 🏗️ 전체 아키텍처
 
-> 이 IRSA Role(`seoul-grafana-athena-role`)은 Grafana와 함께 `siseon-infra-monitoring` 레포에서 정의한다. 본 레포는 Athena/Glue 리소스만 생성하고, 그 접근 권한은 소비 측(Grafana) 레포에서 관리한다.
+```
+EKS (seoul-cluster) / stockops 네임스페이스
+  ├ stockops-api 파드 (Spring Boot)  ─ stdout
+  └ stockops-ai 파드 (FastAPI)       ─ stdout
+                │
+                ▼  (노드의 /var/log/containers/*.log)
+        Fluent Bit (DaemonSet, 노드별 1개)
+                │  서비스별 분리 전송
+                ▼
+        CloudWatch Logs
+          ├ /aws/eks/seoul-cluster/stockops/api
+          └ /aws/eks/seoul-cluster/stockops/ai
+                │
+                ▼
+        Grafana (CloudWatch 데이터소스)  ← siseon-infra-monitoring
+```
 
-권한: `AmazonAthenaFullAccess`, `AWSGlueConsoleFullAccess`, `AmazonS3FullAccess`
+## 📜 수집 대상 및 설계 의도
 
-> S3 권한은 쿼리 결과 쓰기(`siseon-athena-query-results`) + 원본 읽기(`stockops-sensor-data`)가 모두 필요. 현재 FullAccess이며, 추후 두 버킷으로 한정하는 인라인 정책으로 축소 예정.
+| 서비스 | 로그그룹 | 비고 |
+|--------|---------|------|
+| stockops-api (Spring) | `/aws/eks/seoul-cluster/stockops/api` | API 요청/처리 로그 |
+| stockops-ai (FastAPI) | `/aws/eks/seoul-cluster/stockops/ai` | 예측 서비스 로그 (Bedrock 도입 후 확장) |
+
+- **수집 대상 한정**: web 파드는 S3 정적 호스팅으로 이전 예정이라 제외. redis도 제외. 백엔드(api/ai)만 수집해 관측 대상을 명확히 함.
+- **로그그룹 분리**: 서비스별로 로그그룹을 나눠 api 로그와 ai 로그를 독립적으로 조회·분석. Fluent Bit이 `app` 라벨 기반으로 stream을 분리 전송.
+- **보존 7일**: 앱 로그는 실시간 원인 추적이 목적이라 단기 보존. 장기 보관이 필요한 감사 로그(CloudTrail)와 구분.
+
+## 🔧 Fluent Bit 구성
+
+Helm 차트(`fluent/fluent-bit`)로 DaemonSet 배포. 노드마다 1개씩 떠서 해당 노드의 모든 대상 파드 로그를 수집한다.
+
+- **INPUT**: `tail` 플러그인으로 `/var/log/containers/stockops-api*.log`, `stockops-ai*.log`만 감시
+- **FILTER**: `kubernetes` 필터로 네임스페이스/파드 메타데이터 부착
+- **OUTPUT**: `cloudwatch_logs` 플러그인. 태그(`stockops.api.*` / `stockops.ai.*`)로 분기해 서비스별 로그그룹 전송. `auto_create_group=false`로 Terraform이 만든 로그그룹에만 기록.
+
+## 🔐 Fluent Bit 권한 (IRSA)
+
+Fluent Bit이 CloudWatch에 로그를 쓰려면 IAM 권한이 필요하다. Athena와 동일하게 **IRSA 방식**으로 ServiceAccount(`amazon-cloudwatch:fluent-bit`)에 Role(`seoul-fluentbit-role`)을 연결했다.
+
+```hcl
+policy = jsonencode({
+  Statement = [{
+    Effect   = "Allow"
+    Action   = ["logs:CreateLogStream", "logs:PutLogEvents",
+                "logs:DescribeLogStreams", "logs:DescribeLogGroups"]
+    Resource = "arn:aws:logs:ap-northeast-2:<account>:log-group:/aws/eks/seoul-cluster/stockops/*"
+  }]
+})
+```
+
+> 권한을 `/stockops/*` 로그그룹으로 한정해 최소 권한 원칙 적용.
+
+## 📌 로그 포맷 참고
+
+현재 앱 로그는 평문(plain text)으로 수집된다. Grafana에서 **원문 조회·키워드 검색**은 가능하나, 에러율·응답시간 같은 집계는 로그가 아니라 **메트릭(Prometheus, `/actuator/prometheus`)** 으로 처리한다. (메트릭이 로그 파싱보다 정확하므로 JSON 로깅은 도입하지 않음)
 
 ---
 
 ## 🔮 향후 작업
 
-본 레포는 IoT 외에도 애플리케이션 관측 데이터 파이프라인을 확장할 예정이다.
+| 종류 | 흐름 | 저장 위치 | Grafana 연결 | 상태 |
+|------|------|-----------|--------------|------|
+| IoT 센서 | IoT Core → Firehose → S3 → Athena | S3 | Athena | ✅ 완료 |
+| 애플리케이션 로그 | stdout → Fluent Bit → CloudWatch Logs | CloudWatch | CloudWatch | ✅ 완료 |
+| 애플리케이션 메트릭 | `/actuator/prometheus` → ServiceMonitor → Prometheus | Prometheus | Prometheus | ⬜ 앱 actuator 인증 해제 후 |
+| 분산 추적 | OTel SDK → OTel Collector → X-Ray | AWS X-Ray | X-Ray | ⬜ Bedrock·서비스간 호출 본격화 후 |
 
-| 종류 | 흐름 | 저장 위치 | Grafana 연결 |
-|------|------|-----------|--------------|
-| 애플리케이션 메트릭 | `/metrics` → ServiceMonitor → Prometheus | Prometheus | Prometheus |
-| 애플리케이션 로그 | stdout → Fluent Bit → CloudWatch Logs | CloudWatch | CloudWatch |
-| 분산 추적 | OTel SDK → OTel Collector → X-Ray | AWS X-Ray | X-Ray |
-| IoT 센서 | IoT Core → Firehose → S3 → Athena | S3 | Athena ✅ |
-
-> 분산 추적은 기존 X-Ray SDK 대신 OpenTelemetry(OTel) 기반으로 전환 확정. X-Ray SDK가 유지보수 모드로 전환되는 추세이며, 백엔드 교체 유연성 확보 목적.
+> 분산 추적은 기존 X-Ray SDK 대신 OpenTelemetry(OTel) 기반으로 전환 확정. X-Ray SDK가 유지보수 모드로 전환되는 추세이며, OTel Collector를 통해 백엔드(X-Ray/Tempo/Jaeger) 교체 유연성을 확보. 계측(앱 SDK)은 현수님 영역, Collector 배포는 본 레포 영역으로 분리.

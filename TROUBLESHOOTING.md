@@ -1,6 +1,6 @@
 # 🔧 StockOps Observability 트러블슈팅
 
-> IoT 센서 파이프라인 + Grafana Athena 연동 구축 중 겪은 문제와 해결 기록
+> IoT 센서 파이프라인 + Grafana Athena 연동 + 애플리케이션 로그(Fluent Bit) 구축 중 겪은 문제와 해결 기록
 
 ---
 
@@ -18,6 +18,9 @@
 | 8 | 패널 전체 No data (region) | target에 connectionArgs.region 추가 |
 | 9 | 변수 All 선택 시 No data | includeAll = false |
 | 10 | Azure 포털 컨테이너 403 | Storage Account에 Reader 역할 추가 |
+| 11 | Fluent Bit CrashLoopBackOff | liveness probe 경로 + Health_Check On |
+| 12 | helm 릴리스 잠김 (operation in progress) | helm uninstall + state rm 후 재배포 |
+| 13 | aws provider 버전 충돌 | `~> 5.0` → `~> 6.0`, init -upgrade |
 
 ---
 
@@ -42,13 +45,7 @@ SELECT typeof(timestamp) FROM stockops_sensor.sensor_data LIMIT 1
 -- varchar
 ```
 
-**해결**: Glue 테이블 컬럼 타입을 `string` → `timestamp`로 변경. ISO8601(`2026-06-10T03:49:59Z`) 포맷은 자동 파싱됨.
-
-```sql
--- timestamp(3)
-```
-
-추가로 패널 쿼리에서 `timestamp AS time` alias 필수 (Athena 플러그인이 `time` 컬럼을 시계열 축으로 인식).
+**해결**: Glue 테이블 컬럼 타입을 `string` → `timestamp`로 변경. ISO8601(`2026-06-10T03:49:59Z`) 포맷은 자동 파싱됨. 추가로 패널 쿼리에서 `timestamp AS time` alias 필수.
 
 ---
 
@@ -76,19 +73,7 @@ no EC2 IMDS role found, ec2imds: GetMetadata, context deadline exceeded
 
 **원인**: EKS Node Role에 Athena 권한을 붙였으나, Grafana Pod가 EC2 IMDS로 자격증명을 가져오지 못함. EKS에서 Pod 레벨 IAM은 IRSA가 표준.
 
-**해결**: Grafana 전용 IAM Role(`seoul-grafana-athena-role`)을 만들고 OIDC 신뢰관계로 Grafana ServiceAccount(`grafana-athena-sa`)에 연결. Helm values의 `serviceAccount.annotations`에 `eks.amazonaws.com/role-arn` 추가.
-
-```hcl
-serviceAccount = {
-  create = true
-  name   = "grafana-athena-sa"
-  annotations = {
-    "eks.amazonaws.com/role-arn" = aws_iam_role.grafana_athena_role.arn
-  }
-}
-```
-
-> Node Role에 붙였던 권한 3개는 삭제.
+**해결**: Grafana 전용 IAM Role(`seoul-grafana-athena-role`)을 만들고 OIDC 신뢰관계로 Grafana ServiceAccount(`grafana-athena-sa`)에 연결. Helm values의 `serviceAccount.annotations`에 `eks.amazonaws.com/role-arn` 추가. Node Role에 붙였던 권한 3개는 삭제.
 
 ---
 
@@ -100,19 +85,9 @@ STS: AssumeRoleWithWebIdentity, StatusCode: 403,
 AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity
 ```
 
-**원인**: IRSA Role 신뢰관계의 Federated ARN에 공백이 포함됨.
+**원인**: IRSA Role 신뢰관계의 Federated ARN에 공백이 포함됨. (`...448768137813 :oidc-provider...`)
 
-```
-arn:aws:iam::448768137813 :oidc-provider/...   ← 계정ID 뒤 공백
-```
-
-**해결**: 공백 제거.
-
-```hcl
-Federated = "arn:aws:iam::448768137813:oidc-provider/${local.eks_oidc_issuer}"
-```
-
-OIDC issuer는 데이터 소스에서 동적 추출:
+**해결**: 공백 제거. OIDC issuer는 데이터 소스에서 동적 추출.
 
 ```hcl
 locals {
@@ -124,11 +99,7 @@ locals {
 
 ## #6. 쿼리 결과 S3 쓰기 AccessDenied
 
-**문제**:
-```
-Access denied when writing output to url:
-s3://siseon-athena-query-results/results/....csv
-```
+**문제**: `Access denied when writing output to url: s3://siseon-athena-query-results/results/....csv`
 
 **원인**: Grafana Role에 `AmazonS3ReadOnlyAccess`만 부여. Athena가 쿼리 결과를 S3에 **써야** 하는데 쓰기 권한 없음.
 
@@ -138,12 +109,7 @@ s3://siseon-athena-query-results/results/....csv
 
 ## #7. Grafana 대시보드 안 보임
 
-**문제**: 폴더는 생성됐으나 대시보드가 목록에 안 뜸. 로그:
-```
-the same UID is used more than once uid=stockops-iot-custom
-providers="[iot-custom sidecarProvider]"
-dashboards provisioning provider has no database write permissions because of duplicates
-```
+**문제**: 폴더는 생성됐으나 대시보드가 목록에 안 뜸. 로그에 `the same UID is used more than once`, `no database write permissions because of duplicates`.
 
 **원인**: kube-prometheus-stack의 `sidecarProvider`가 대시보드를 중복 인식해 UID 충돌. provider가 쓰기 권한을 잃음.
 
@@ -160,12 +126,9 @@ sidecar = {
 
 ## #8. 패널 전체 No data (region)
 
-**문제**: 변수(창고)는 정상인데 모든 패널 빨간 ⚠️. Inspect → Error:
-```
-Cannot read properties of undefined (reading 'region')
-```
+**문제**: 변수(창고)는 정상인데 모든 패널 빨간 ⚠️. Inspect → Error: `Cannot read properties of undefined (reading 'region')`
 
-**원인**: 프로비저닝된 패널 target에 region 정보 없음. Explore에서는 상단 드롭다운이 자동으로 region을 채워줬으나, 코드 정의 패널엔 누락되어 플러그인이 `undefined.region`을 읽다 실패.
+**원인**: 프로비저닝된 패널 target에 region 정보 없음. Explore에서는 상단 드롭다운이 자동으로 채웠으나, 코드 정의 패널엔 누락.
 
 **해결**: 모든 패널 target(및 변수 쿼리)에 `connectionArgs` 추가.
 
@@ -185,7 +148,7 @@ connectionArgs = {
 
 **원인**: `$site_id`가 `All`로 치환되어 `LIKE '%All%'`이 되고 매칭 없음.
 
-**해결**: `includeAll = false`로 변경. 항상 실제 창고값이 기본 선택됨. (창고명이 추후 변경될 수 있어 `current` 하드코딩은 하지 않음)
+**해결**: `includeAll = false`로 변경. (창고명이 추후 변경될 수 있어 `current` 하드코딩은 하지 않음)
 
 ---
 
@@ -195,4 +158,54 @@ connectionArgs = {
 
 **원인**: 데이터 평면 권한(Storage Blob Data Owner)만 있고, 포털 UI 탐색용 제어 평면(Control Plane) 권한 부재.
 
-**해결**: Storage Account 범위에서 `Reader` 역할 추가 부여. UI 접근 + 데이터 조회 모두 해결.
+**해결**: Storage Account 범위에서 `Reader` 역할 추가 부여.
+
+---
+
+## #11. Fluent Bit CrashLoopBackOff
+
+**문제**: Fluent Bit 파드가 CrashLoopBackOff. 근데 로그를 보면 CloudWatch 로그 스트림 생성·전송까지 정상 동작 후 `caught signal (SIGTERM)`으로 종료. Exit Code 0(정상 종료).
+
+**원인**: 기능은 정상이나 **liveness probe**가 실패. 기본 probe가 `http://:2020/` 루트 경로를 찌르는데 Fluent Bit이 거기 응답을 안 줘서 probe 실패 → 쿠버네티스가 파드를 계속 재시작 → CrashLoop.
+
+**해결**: Health Check 엔드포인트를 켜고 probe 경로를 거기로 지정.
+
+```hcl
+# SERVICE 설정에 추가
+HTTP_Server On
+HTTP_Listen 0.0.0.0
+HTTP_Port 2020
+Health_Check On
+
+# Helm values에 probe 경로 재정의
+livenessProbe  = { httpGet = { path = "/api/v1/health", port = 2020 } }
+readinessProbe = { httpGet = { path = "/api/v1/health", port = 2020 } }
+```
+
+---
+
+## #12. helm 릴리스 잠김 (operation in progress)
+
+**문제**: apply가 오래 걸려 중단(Ctrl+C)한 뒤 재apply 시 `another operation (install/upgrade/rollback) is in progress` 또는 `cannot re-use a name that is still in use`.
+
+**원인**: 중단된 apply가 helm 릴리스를 pending 상태로 남겨 잠김. Terraform state엔 기록 안 됨.
+
+**해결**: 릴리스 삭제 후 state에서 제거하고 재배포.
+
+```
+helm uninstall fluent-bit -n amazon-cloudwatch
+terraform state rm module.app_logging.helm_release.fluentbit
+terraform apply -auto-approve
+```
+
+> `helm rollback`은 이전 정상 리비전이 없으면 실패(`release has no 0 version`)하므로 uninstall이 확실.
+
+---
+
+## #13. aws provider 버전 충돌
+
+**문제**: `app_logging`용 providers.tf 추가 후 `terraform init`에서 `locked provider ... aws 6.49.0 does not match configured version constraint ~> 5.0`.
+
+**원인**: `.terraform.lock.hcl`에 aws 6.x가 잠겨있는데 providers.tf에서 `~> 5.0`으로 제약.
+
+**해결**: 제약을 `~> 6.0`으로 올리고 `terraform init -upgrade`.
