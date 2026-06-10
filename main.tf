@@ -11,3 +11,15 @@ module "iot_pipeline" {
   sensor_bucket_name    = var.sensor_bucket_name
   query_result_bucket   = var.query_result_bucket
 }
+
+module "app_logging" {
+  source = "./modules/app_logging"
+
+  cluster_name    = var.cluster_name
+  aws_account_id  = var.aws_account_id
+  eks_oidc_issuer = local.eks_oidc_issuer
+}
+
+locals {
+  eks_oidc_issuer = replace(data.aws_eks_cluster.this.identity[0].oidc[0].issuer, "https://", "")
+}
