@@ -23,3 +23,10 @@ module "app_logging" {
 locals {
   eks_oidc_issuer = replace(data.aws_eks_cluster.this.identity[0].oidc[0].issuer, "https://", "")
 }
+
+module "tracing" {
+  source = "./modules/tracing"
+
+  aws_account_id  = var.aws_account_id
+  eks_oidc_issuer = local.eks_oidc_issuer
+}

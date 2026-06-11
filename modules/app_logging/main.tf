@@ -75,6 +75,18 @@ resource "helm_release" "fluentbit" {
 
   values = [
     yamlencode({
+      livenessProbe = {
+        httpGet = {
+          path = "/api/v1/health"
+          port = 2020
+        }
+      }
+      readinessProbe = {
+        httpGet = {
+          path = "/api/v1/health"
+          port = 2020
+        }
+      }  
       serviceAccount = {
         create = true
         name   = "fluent-bit"
