@@ -1,4 +1,4 @@
-# 🌡️ StockOps 관측 파이프라인 설계 문서
+# 🔭 StockOps 관측 파이프라인 설계 문서
 
 > IoT 센서 데이터(Glue/Athena)와 애플리케이션 로그(Fluent Bit/CloudWatch) 수집·적재 설계 문서
 
@@ -230,13 +230,89 @@ policy = jsonencode({
 
 ---
 
-## 🔮 향후 작업
+# 3부. 분산 추적 파이프라인
 
-| 종류 | 흐름 | 저장 위치 | Grafana 연결 | 상태 |
+## 🏗️ 전체 아키텍처
+
+```
+EKS (seoul-cluster) / stockops 네임스페이스
+  ├ stockops-api 파드 (Spring + micrometer-tracing-bridge-otel)
+  └ stockops-ai 파드 (FastAPI + opentelemetry-sdk)
+                │  OTLP/HTTP (traceparent 헤더로 trace 전파)
+                ▼
+  ADOT Collector (opentelemetry 네임스페이스, Deployment)
+    • OTLP 수신 (4317/gRPC, 4318/HTTP)
+    • batch 프로세서
+    • awsxray exporter
+                │
+                ▼
+        AWS X-Ray (ap-northeast-2)
+          • Trace Map (서비스 맵)
+          • 개별 trace waterfall (구간별 소요 시간)
+```
+
+## 🎯 설계 의도 — 왜 OTel + ADOT Collector인가
+
+| 선택 | 이유 |
+|------|------|
+| OpenTelemetry SDK | X-Ray SDK가 유지보수 모드로 가는 추세. OTel은 벤더 중립 표준이라 앱 계측을 한 번 하면 백엔드를 바꿀 수 있다. |
+| ADOT Collector | AWS가 X-Ray exporter를 내장한 OTel Collector 배포판. 앱은 표준 OTLP로만 보내면 Collector가 X-Ray 포맷으로 변환한다. |
+| 백엔드 = X-Ray | AWS 네이티브로 CloudWatch 콘솔에 통합돼 별도 운영 부담이 없다. 추후 Tempo/Jaeger로 교체 시 Collector exporter만 바꾸면 된다. |
+
+## 🔧 ADOT Collector 구성
+
+Helm 차트(`opentelemetry-collector`)에 ADOT 이미지(`aws-otel-collector`)를 얹어 Deployment 모드로 배포한다.
+
+```hcl
+config = {
+  receivers  = { otlp = { protocols = { grpc = {...:4317}, http = {...:4318} } } }
+  processors = { batch = {} }
+  exporters  = { awsxray = { region = "ap-northeast-2" } }
+  service = {
+    pipelines = { traces = { receivers=["otlp"], processors=["batch"], exporters=["awsxray"] } }
+  }
+}
+```
+
+- **receivers(otlp)**: 앱이 보내는 추적을 4317(gRPC)/4318(HTTP)로 수신.
+- **exporters(awsxray)**: 수신한 추적을 X-Ray 세그먼트로 변환해 전송.
+- 현재 파이프라인은 **traces only** (Phase 1). 앱 SDK도 traces만 켜져 있어 metrics/logs는 추후 확장.
+
+## 🔐 ADOT 권한 (IRSA)
+
+Collector가 X-Ray에 세그먼트를 쓰려면 IAM 권한이 필요하다. Fluent Bit·Grafana와 동일하게 **IRSA**로 ServiceAccount(`opentelemetry:adot-collector`)에 Role(`seoul-adot-collector-role`)을 연결한다.
+
+| 정책 | 용도 |
+|------|------|
+| AWSXRayDaemonWriteAccess | X-Ray 세그먼트 전송 |
+
+## 🔗 앱 연동 (환경변수)
+
+Collector를 깐 뒤, 앱 파드(김진우 인프라 레포의 Deployment)에 OTLP 엔드포인트 환경변수를 주입해야 추적이 흐른다.
+
+| 서비스 | 환경변수 | 값 |
+|--------|---------|-----|
+| api (Spring) | `STOCKOPS_OTLP_TRACING_ENDPOINT` | `http://adot-collector-opentelemetry-collector.opentelemetry:4318/v1/traces` |
+| ai (FastAPI) | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://adot-collector-opentelemetry-collector.opentelemetry:4318` |
+
+> 형식 차이 주의: Spring(micrometer)은 traces 전체 경로(`/v1/traces`)를 받고, FastAPI(OTel SDK)는 베이스 주소만 받아 SDK가 경로를 자동으로 붙인다.
+
+## 📌 추적 범위와 한계
+
+- **단일 서비스 추적**: 모든 api 요청(재고/상품/출고 등 CRUD)은 X-Ray에 기록되어, 각 요청이 보안 필터 → 컨트롤러 → DB → 응답 구간에서 각각 몇 ms를 쓰는지 waterfall로 분석할 수 있다.
+- **서비스 간(분산) 추적**: StockOps는 모놀리식 구조라 서비스를 넘나드는 호출이 **AI 예측 경로(api → ai-module)** 가 유일하다. 따라서 Trace Map에서 서비스 간 연결선은 AI 추천 기능이 동작할 때만 생긴다. 그 외 요청은 단일 서비스 내부 추적으로 기록되는 것이 정상이다.
+- AI 모듈이 완성되어 api가 ai를 실제 호출하면, 동일 trace에 ai 세그먼트가 traceparent 전파로 자동 연결되도록 인프라(Collector)는 준비돼 있다.
+
+---
+
+## 🔮 관측 항목 현황
+
+| 종류 | 흐름 | 저장 위치 | Grafana/백엔드 | 상태 |
 |------|------|-----------|--------------|------|
 | IoT 센서 | IoT Core → Firehose → S3 → Athena | S3 | Athena | ✅ 완료 |
 | 애플리케이션 로그 | stdout → Fluent Bit → CloudWatch Logs | CloudWatch | CloudWatch | ✅ 완료 |
-| 애플리케이션 메트릭 | `/actuator/prometheus` → ServiceMonitor → Prometheus | Prometheus | Prometheus | ⬜ 앱 actuator 인증 해제 후 |
-| 분산 추적 | OTel SDK → OTel Collector → X-Ray | AWS X-Ray | X-Ray | ⬜ Bedrock·서비스간 호출 본격화 후 |
+| 애플리케이션 메트릭 | `/actuator/prometheus` → ServiceMonitor → Prometheus | Prometheus | Prometheus | ✅ 완료 (api) |
+| 분산 추적 | OTel SDK → ADOT Collector → X-Ray | AWS X-Ray | X-Ray | ✅ 완료 |
+| Bedrock 사용량 | Bedrock → CloudWatch(AWS/Bedrock) → Grafana | CloudWatch | CloudWatch | ⬜ Bedrock 활성화 후 |
 
-> 분산 추적은 기존 X-Ray SDK 대신 OpenTelemetry(OTel) 기반으로 전환 확정. X-Ray SDK가 유지보수 모드로 전환되는 추세이며, OTel Collector를 통해 백엔드(X-Ray/Tempo/Jaeger) 교체 유연성을 확보. 계측(앱 SDK)은 현수님 영역, Collector 배포는 본 레포 영역으로 분리.
+> 메트릭은 api(Spring actuator)만 수집한다. ai(FastAPI)는 `/metrics`가 없어 메트릭 대신 분산 추적으로 관측하기로 역할을 분리했다. 분산 추적은 X-Ray SDK 대신 OpenTelemetry(OTel) 기반으로 구성했다 — X-Ray SDK가 유지보수 모드로 전환되는 추세이고, OTel Collector를 통해 백엔드(X-Ray/Tempo/Jaeger) 교체 유연성을 확보하기 위함. 계측(앱 SDK)은 현수님 영역, Collector 배포는 본 레포 영역으로 분리했다.

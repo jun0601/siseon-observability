@@ -21,6 +21,8 @@
 | 11 | Fluent Bit CrashLoopBackOff | liveness probe 경로 + Health_Check On |
 | 12 | helm 릴리스 잠김 (operation in progress) | helm uninstall + state rm 후 재배포 |
 | 13 | aws provider 버전 충돌 | `~> 5.0` → `~> 6.0`, init -upgrade |
+| 14 | ADOT Collector 앱 추적 안 들어옴 | 앱 env(OTLP 엔드포인트) 미주입 → Deployment에 환경변수 추가 |
+| 15 | X-Ray 서비스 간 화살표 안 생김 | 모놀리식이라 분산 호출이 AI 경로뿐 — 설계 특성(정상) |
 
 ---
 
@@ -209,3 +211,34 @@ terraform apply -auto-approve
 **원인**: `.terraform.lock.hcl`에 aws 6.x가 잠겨있는데 providers.tf에서 `~> 5.0`으로 제약.
 
 **해결**: 제약을 `~> 6.0`으로 올리고 `terraform init -upgrade`.
+
+---
+
+## #14. ADOT Collector를 깔았는데 추적이 안 들어옴
+
+**문제**: ADOT Collector가 정상 Running인데 X-Ray에 추적이 하나도 안 뜸.
+
+**원인**: Collector는 "추적을 받을 준비"만 된 상태이고, **앱이 Collector로 추적을 보내야** 한다. 앱(api/ai) Deployment에 OTLP 엔드포인트 환경변수가 없어서 앱이 기본값(localhost)으로 보내다 아무 데도 안 갔다.
+
+**해결**: 앱 Deployment(인프라 레포)에 Collector 주소를 환경변수로 주입.
+
+```
+api: STOCKOPS_OTLP_TRACING_ENDPOINT = http://adot-collector-opentelemetry-collector.opentelemetry:4318/v1/traces
+ai : OTEL_EXPORTER_OTLP_ENDPOINT    = http://adot-collector-opentelemetry-collector.opentelemetry:4318
+```
+
+> 배포 순서도 중요: Collector를 먼저 띄우고 앱 env를 나중에 넣는다. 반대로 하면 앱이 없는 Collector로 추적을 보내려다 연결 실패 로그가 쌓인다.
+
+**교훈**: 추적 파이프라인은 "Collector(받는 쪽) + 앱 env(보내는 쪽)" 둘 다 있어야 동작한다. Collector만 깔고 끝이 아니다.
+
+---
+
+## #15. X-Ray Trace Map에 서비스 간 화살표가 안 생김
+
+**문제**: 추적은 잘 수집되는데(118개 trace) Trace Map의 노드들이 "클라이언트 → 서비스" 단일 화살표뿐이고, 서비스 간(stockops → ai-module) 연결선이 없음.
+
+**원인**: 이건 X-Ray나 Collector의 문제가 아니라 **앱 구조 특성**이다. StockOps는 모놀리식이라 대부분 요청(재고/상품/출고 CRUD)이 api 내부 + DB에서 끝난다. 서비스를 넘나드는 호출은 AI 예측 경로(api → ai-module)가 유일한데, AI 모듈이 아직 미완성이라 실제 호출이 일어나지 않아 화살표가 안 생긴 것.
+
+**해결(이해)**: 단일 서비스 추적도 X-Ray의 정당한 용도다. 각 요청의 내부 병목(보안 필터/DB 구간 등)은 waterfall로 분석 가능하다. 서비스 간 화살표는 AI 모듈 완성 시 traceparent 전파로 자동 연결된다 — 인프라는 이미 준비됨.
+
+**교훈**: "화살표 개수 = X-Ray 완성도"가 아니다. 분산 화살표는 마이크로서비스 간 호출이 있을 때 나오는 그림이고, 모놀리식에서는 단일 추적이 자연스럽다.
