@@ -26,6 +26,7 @@
 | 16 | 멀티리전 로그 리전 전환 시 No data | hidden 변수 제거 + `${var:text}` 트릭으로 리전+클러스터 동시 전환 |
 | 17 | ai ServiceMonitor 부활 시 중복/유실 | servicemonitor.tf 재작성 (api 유실 복구 + ai 중복 정리) |
 | 18 | generate가 ai 호출 안 함 (폴백) | api `AI_SERVICE_URL`·ai `DATABASE_URL` env 주입 + 집계 테이블 시드 |
+| 19 | api 메트릭 패널 전체 No data | `/actuator/prometheus` 401 → api env `STOCKOPS_ACTUATOR_PROMETHEUS_PUBLIC=true` 추가 |
 
 ---
 
@@ -248,7 +249,7 @@ ai : OTEL_EXPORTER_OTLP_ENDPOINT    = http://adot-collector-opentelemetry-collec
 - 시드: 상품 + `analytics.daily_demand_history` 15일치 (generate가 보는 건 outbounds raw가 아니라 집계 테이블)
 - 호출: `POST /api/v1/ai/recommendations/generate?businessDate=...&model=prophet`
 
-**결과**: Trace Map 화살표 + waterfall(보안필터 → prophet → ai 원격호출 → 실패 시 statistical 폴백)까지 확인. ai 응답은 현재 422(api의 요청 바디 직렬화 이슈, 앱 영역)지만 호출·추적 연결은 정상.
+**결과**: Trace Map에 `클라이언트 → stockops → stockops-ai-module → Database` 가 한 줄로 연결됐고, waterfall에서 보안필터 → `prophet-compute`(~690ms) → ai 원격호출(`/predict`, ~500ms) → ai-module 내부(`ai.fit_prophet`/`ai.predict_future`) → RDS 조회까지 전 구간이 보인다. 초기엔 ai가 422를 반환했으나(요청 바디 직렬화 이슈, #18) 직렬화 수정 후 **ai 응답 200 + fault 없는 완전한 분산 trace**로 검증 완료.
 
 **교훈**: 분산 추적 화살표는 "실제 서비스 간 호출"이 일어나야 그려진다. Collector·SDK·env·데이터가 모두 갖춰져야 하며, 하나라도 빠지면 호출이 폴백되거나 발생하지 않아 화살표가 안 생긴다.
 
@@ -308,6 +309,26 @@ logGroupNames = ["/aws/eks/${region_target:text}/stockops/api"] # text=클러스
 - `analytics.daily_demand_history`에 (product/center/warehouse=1) 15일치 시드 INSERT. (ai 예측은 최소 14일 이력 필요)
 - `generate?model=prophet`로 호출 → api가 ai `/predict` 실제 호출 → X-Ray 화살표 생성 (#15).
 
-> ai 응답은 현재 422(api가 보내는 요청 바디 `product_id`/`days` 직렬화 이슈). 이는 앱(현수님) 영역이며, 호출·추적 연결 자체는 정상이다. 직렬화가 고쳐지면 ai 예측 성공 + 🤖 메트릭 패널 값까지 채워진다.
+> **(해결됨)** ai 응답이 초기엔 422였다 — api가 보내는 요청 바디가 `productId`(camelCase)인데 FastAPI/Pydantic은 `product_id`(snake_case)를 기대해 검증 실패. `AiForecastClient`의 요청 record에 `@JsonProperty("product_id")`를 명시해 해결(앱/현수님 영역). 수정 후 generate 호출 시 ai `/predict`가 200으로 성공하고, X-Ray에 fault 없는 trace가 기록된다. (🤖 ai 메트릭 패널은 generate 트래픽이 쌓이면 값이 채워진다.)
 
 **교훈**: "응답 200"이 "정상 동작"을 보장하지 않는다. AI 연동은 ① 호출 주소(env) ② ai의 DB 접근(env) ③ 예측 재료(집계 데이터) 세 가지가 모두 있어야 실제 호출이 일어난다. 관측(추적/메트릭)이 이 빈 구멍을 정확히 드러냈다.
+---
+
+## #19. api 메트릭 패널 전체 No data (`/actuator/prometheus` 401)
+
+**문제**: 앱 재배포 후 앱 메트릭 대시보드의 api 6패널이 전부 No data. ai 패널은 정상.
+
+**원인**: Prometheus 타겟 확인 결과 `serviceMonitor/monitoring/stockops-api/0`가 `health=down`, `lastError = server returned HTTP status 401`. api(Spring)의 `/actuator/prometheus`가 인증에 막혀 스크랩이 거부된 것. ai 타겟(`:8000/metrics`)은 `up`이라 멀쩡 → 대시보드/ServiceMonitor 문제가 아니라 **수집 경로 차단(회귀)**.
+
+api `SecurityConfig`는 `stockops.actuator.prometheus-public=true`일 때만 `/actuator/prometheus`를 `permitAll` 하는데, 재배포 파드에 이 값이 없어 기본값 `false`로 떨어져 401. (422 직렬화 fix 배포 때 함께 누락된 것으로 추정)
+
+**해결**: 인프라 레포(`seoul/kubernetes.tf`)의 api 컨테이너 env 블록에 한 줄 추가(진우님 영역).
+```hcl
+env {
+  name  = "STOCKOPS_ACTUATOR_PROMETHEUS_PUBLIC"
+  value = "true"
+}
+```
+> Spring Boot relaxed binding으로 `stockops.actuator.prometheus-public` 프로퍼티가 env `STOCKOPS_ACTUATOR_PROMETHEUS_PUBLIC`에 매핑된다. apply 후 파드 재시작 → Prometheus 타겟 `up` → 부하 주면 api 6패널 채워짐.
+
+**교훈**: 대시보드가 비었을 때 "트래픽 없음"으로 단정하지 말 것. Prometheus 타겟 `health`/`lastError`를 먼저 봐야 한다 — 수집이 끊긴(401/down) 상태면 부하를 줘도 메모리에만 쌓이고 대시보드엔 안 뜬다. 진단(타겟 상태) → 처방(부하 vs 설정 수정) 순서가 핵심.

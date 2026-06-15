@@ -333,10 +333,11 @@ Collector를 깐 뒤, 앱 파드(김진우 인프라 레포의 Deployment)에 OT
 ## 📌 추적 범위와 검증
 
 - **단일 서비스 추적**: 모든 api 요청(재고/상품/출고 등 CRUD)은 X-Ray에 기록되어, 각 요청이 보안 필터 → 컨트롤러 → DB → 응답 구간에서 각각 몇 ms를 쓰는지 waterfall로 분석할 수 있다.
-- **서비스 간(분산) 추적 — 검증 완료 ✅**: StockOps는 모놀리식 구조라 서비스를 넘나드는 호출이 **AI 예측 경로(api → ai-module)** 가 유일하다. AI 추천 생성(`POST /api/v1/ai/recommendations/generate?model=prophet`)을 실제로 호출하면 api가 ai-module의 `/predict`를 부르고, **X-Ray Trace Map에 `클라이언트 → stockops → stockops-ai-module` 화살표가 생성**된다. traceparent 헤더가 서비스 경계를 넘어 전파되어 하나의 trace로 자동 연결된다.
-- **Waterfall 분석**: 개별 trace에서 보안 필터체인(247ms) → 권한 검증 → prophet 예측 연산 → ai-module 원격 호출까지 구간별 소요 시간이 그대로 보인다. ai 호출 실패 시 통계 기반 모델(`statistical-compute`)로 자동 폴백하는 graceful degradation도 추적에 드러난다.
+- **서비스 간(분산) 추적 — 검증 완료 ✅**: StockOps는 모놀리식 구조라 서비스를 넘나드는 호출이 **AI 예측 경로(api → ai-module)** 가 유일하다. AI 추천 생성(`POST /api/v1/ai/recommendations/generate?businessDate=&model=prophet`)을 실제로 호출하면 api가 ai-module의 `/predict`를 부르고, **X-Ray Trace Map에 `클라이언트 → stockops → stockops-ai-module → Database` 가 한 줄로 연결**된다(ai-module 응답 200). traceparent 헤더가 서비스 경계를 넘어 전파되어 하나의 trace로 자동 연결된다 — 코드로 심은 게 아니라 OTel 표준 전파의 결과다.
+- **Waterfall 분석 (성공 trace 기준)**: 개별 trace에서 전체 요청(약 1.76초)이 각 구간에서 쓴 시간이 그대로 보인다. 보안 필터체인·권한 검증은 수~수십 ms로 비용이 거의 없고, 핵심은 prophet 예측 연산(`prophet-compute` 약 690ms)이며 그 안에서 ai-module 원격 호출(`http post → http://stockops-ai-svc.stockops:8000/predict`)이 약 500ms를 차지한다. ai-module 세그먼트로 내려가면 그 내부에서 `ai.forecast → ai.train_or_load_model → ai.fit_prophet → ai.predict_future`와 RDS 조회(`Database::SQL`)까지 다시 세분화돼, **어느 구간이 병목인지(api인지 ai인지, ai 안에서도 학습인지 예측인지)를 추적 한 번으로 진단**할 수 있다.
+- **자동 계측의 깊이 (`@Observed`)**: api의 `AiForecastClient.getForecast`처럼 메서드에 `@Observed`만 붙이면 자식 span(`ai-forecast-predict`)으로 waterfall에 자동 노출된다. 이를 가능케 하는 `ObservedAspect` 빈을 `ObservabilityConfig`에 등록해, 비즈니스 로직을 건드리지 않고 관측 가능성만 얹는 구조를 만들었다. (앱 계측 — 현수님 영역)
 
-> 검증을 위해 RDS에 상품 + `analytics.daily_demand_history` 수요 이력(15일치)을 적재하고 generate API를 호출했다. api↔ai 연동을 위해 api에 `STOCKOPS_AI_SERVICE_URL`, ai에 `DATABASE_URL` 환경변수 주입이 선행됐다. (현재 api의 ai 요청 바디 직렬화 이슈로 ai가 422를 반환하지만, 호출·추적 연결 자체는 정상 동작하며 직렬화 수정은 앱(현수님) 영역이다.)
+> 검증을 위해 RDS에 상품 + `analytics.daily_demand_history` 수요 이력(15일치)을 적재하고 generate API를 호출했다. api↔ai 연동을 위해 api에 `STOCKOPS_AI_SERVICE_URL`, ai에 `DATABASE_URL` 환경변수 주입이 선행됐다. 초기엔 api가 ai로 보내는 바디 직렬화 이슈(`productId` camelCase ↔ FastAPI가 기대하는 `product_id` snake_case 불일치)로 ai가 422를 반환했으나, `AiForecastClient`의 요청 record에 `@JsonProperty("product_id")`를 명시해 해결(앱/현수님 영역). 수정 후 generate 호출 시 **api→ai `/predict`가 HTTP 200으로 성공하고, X-Ray Trace Map과 waterfall에 fault 없는 완전한 분산 trace가 기록되는 것을 검증 완료**했다.
 
 ---
 
