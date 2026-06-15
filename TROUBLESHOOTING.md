@@ -22,7 +22,10 @@
 | 12 | helm 릴리스 잠김 (operation in progress) | helm uninstall + state rm 후 재배포 |
 | 13 | aws provider 버전 충돌 | `~> 5.0` → `~> 6.0`, init -upgrade |
 | 14 | ADOT Collector 앱 추적 안 들어옴 | 앱 env(OTLP 엔드포인트) 미주입 → Deployment에 환경변수 추가 |
-| 15 | X-Ray 서비스 간 화살표 안 생김 | 모놀리식이라 분산 호출이 AI 경로뿐 — 설계 특성(정상) |
+| 15 | X-Ray 서비스 간 화살표 안 생김 | api→ai 실호출 + 시드 데이터로 분산 추적 화살표 생성 성공 |
+| 16 | 멀티리전 로그 리전 전환 시 No data | hidden 변수 제거 + `${var:text}` 트릭으로 리전+클러스터 동시 전환 |
+| 17 | ai ServiceMonitor 부활 시 중복/유실 | servicemonitor.tf 재작성 (api 유실 복구 + ai 중복 정리) |
+| 18 | generate가 ai 호출 안 함 (폴백) | api `AI_SERVICE_URL`·ai `DATABASE_URL` env 주입 + 집계 테이블 시드 |
 
 ---
 
@@ -233,12 +236,78 @@ ai : OTEL_EXPORTER_OTLP_ENDPOINT    = http://adot-collector-opentelemetry-collec
 
 ---
 
-## #15. X-Ray Trace Map에 서비스 간 화살표가 안 생김
+## #15. X-Ray Trace Map에 서비스 간 화살표가 안 생김 → 생성 성공
 
-**문제**: 추적은 잘 수집되는데(118개 trace) Trace Map의 노드들이 "클라이언트 → 서비스" 단일 화살표뿐이고, 서비스 간(stockops → ai-module) 연결선이 없음.
+**문제**: 추적은 잘 수집되는데 Trace Map이 "클라이언트 → 서비스" 단일 화살표뿐이고, 서비스 간(stockops → ai-module) 연결선이 없음.
 
-**원인**: 이건 X-Ray나 Collector의 문제가 아니라 **앱 구조 특성**이다. StockOps는 모놀리식이라 대부분 요청(재고/상품/출고 CRUD)이 api 내부 + DB에서 끝난다. 서비스를 넘나드는 호출은 AI 예측 경로(api → ai-module)가 유일한데, AI 모듈이 아직 미완성이라 실제 호출이 일어나지 않아 화살표가 안 생긴 것.
+**원인**: 인프라 문제가 아니라 **실제 분산 호출이 일어나지 않아서**였다. StockOps는 모놀리식이라 서비스를 넘나드는 호출은 AI 예측 경로(api → ai-module)가 유일한데, ① 이 경로가 `model=prophet`일 때만 ai를 호출하고 ② api↔ai 연동 env가 빠져 있었으며 ③ 예측에 필요한 데이터가 없어 호출 자체가 발생하지 않았다.
 
-**해결(이해)**: 단일 서비스 추적도 X-Ray의 정당한 용도다. 각 요청의 내부 병목(보안 필터/DB 구간 등)은 waterfall로 분석 가능하다. 서비스 간 화살표는 AI 모듈 완성 시 traceparent 전파로 자동 연결된다 — 인프라는 이미 준비됨.
+**해결**: 아래를 갖춰 api가 ai를 실제로 호출하게 만들자 **Trace Map에 `클라이언트 → stockops → stockops-ai-module` 화살표가 생성**됐다.
+- api env `STOCKOPS_AI_SERVICE_URL` = `http://stockops-ai-svc.stockops:8000` (미설정 시 localhost로 폴백)
+- ai env `DATABASE_URL` (ai가 RDS 직접 조회)
+- 시드: 상품 + `analytics.daily_demand_history` 15일치 (generate가 보는 건 outbounds raw가 아니라 집계 테이블)
+- 호출: `POST /api/v1/ai/recommendations/generate?businessDate=...&model=prophet`
 
-**교훈**: "화살표 개수 = X-Ray 완성도"가 아니다. 분산 화살표는 마이크로서비스 간 호출이 있을 때 나오는 그림이고, 모놀리식에서는 단일 추적이 자연스럽다.
+**결과**: Trace Map 화살표 + waterfall(보안필터 → prophet → ai 원격호출 → 실패 시 statistical 폴백)까지 확인. ai 응답은 현재 422(api의 요청 바디 직렬화 이슈, 앱 영역)지만 호출·추적 연결은 정상.
+
+**교훈**: 분산 추적 화살표는 "실제 서비스 간 호출"이 일어나야 그려진다. Collector·SDK·env·데이터가 모두 갖춰져야 하며, 하나라도 빠지면 호출이 폴백되거나 발생하지 않아 화살표가 안 생긴다.
+
+---
+
+## #16. 멀티리전 로그 대시보드 리전 전환 시 No data
+
+**문제**: 서울 Grafana 로그 대시보드에 리전 드롭다운을 추가했는데, 미국(오하이오)을 선택하면 No data. 또 일부 구성에서는 서울조차 첫 로드에 No data였다가 Edit → Run queries를 해야 떴다.
+
+**원인**: 두 가지가 겹쳤다.
+1. **로그그룹 하드코딩**: 패널의 `logGroupNames`가 `/aws/eks/seoul-cluster/...`로 고정돼, 리전만 us-east-2로 바뀌고 로그그룹은 seoul-cluster를 찾아 매칭 실패.
+2. **hidden 변수 초기화 버그**: 리전+클러스터를 분리해 클러스터 변수를 `hide=2`로 숨겼더니, 숨긴 변수가 첫 로드에 초기화되지 않아 패널이 빈 값으로 쿼리를 쏴 No data.
+
+**해결**: Grafana 커스텀 변수에서 **값(`${var}`)과 표시 라벨(`${var:text}`)을 동시에 활용**해 드롭다운 1개로 리전·클러스터를 함께 전환. hidden 변수를 없애 초기화 버그를 제거했다.
+
+```hcl
+# 변수: 라벨(text)=클러스터명, 값(value)=리전
+query   = "seoul-cluster : ap-northeast-2,ohio-cluster : us-east-2"
+
+# 패널
+region        = "$region_target"                               # value=리전
+logGroupNames = ["/aws/eks/${region_target:text}/stockops/api"] # text=클러스터명
+```
+
+- 서울 선택 → region `ap-northeast-2` + `/aws/eks/seoul-cluster/...`
+- 오하이오 선택 → region `us-east-2` + `/aws/eks/ohio-cluster/...`
+
+> 정적 커스텀 변수라 첫 로드에 바로 초기화되어 Run queries 없이 자동으로 데이터가 뜬다. 데이터소스는 CloudWatch 하나로 두 리전을 모두 읽는다(target의 region 필드로 결정).
+
+**교훈**: Grafana 커스텀 변수는 value/text 두 값을 따로 꺼낼 수 있다. hidden 변수는 첫 로드 초기화가 불안정하므로, 한 변수로 두 정보를 실어 나르거나 변수를 보이게 두는 편이 안전하다.
+
+---
+
+## #17. ai ServiceMonitor 부활 시 중복 선언 / api 블록 유실
+
+**문제**: 앱 업데이트로 ai에 `/metrics`가 생겨 ai ServiceMonitor를 되살리려 하니 `Duplicate resource` 에러. 확인해보니 `servicemonitor.tf`에 ai 블록이 중복돼 있고, 오히려 **api ServiceMonitor 블록이 사라져** 있었다(클러스터엔 api 메트릭이 수집 안 되는 상태).
+
+**원인**: 이전에 ai를 제거하고 api만 두는 과정에서 파일이 꼬여, api 블록이 유실되고 옛 ai 블록(TODO 주석 포함)이 남아 있었다.
+
+**해결**: `servicemonitor.tf`를 api + ai 둘 다 깔끔히 재작성. api는 `/actuator/prometheus`, ai는 `/metrics`, 둘 다 `port: http` / `release: kube-prometheus-stack` / `depends_on = [helm_release...]`. Prometheus Targets에서 둘 다 1/1 UP 확인.
+
+> ai 메트릭: 예측 처리량(`ai_forecast_requests_total`), 지연 p95(`ai_forecast_duration_seconds` histogram), 모델 캐시 적중률, MAPE 등 비즈니스 메트릭을 노출. histogram이라 api(summary)와 달리 진짜 p95 산출이 가능하다.
+
+---
+
+## #18. generate가 ai를 호출하지 않고 폴백함 (분산 추적 화살표 선행 조건)
+
+**문제**: `generate` API가 200을 반환하는데 ai-module 로그에 `/predict` 호출이 안 찍히고, X-Ray 화살표도 안 생김. api 로그엔 "Generated 0 snapshots".
+
+**원인**: 단계별로 막혀 있었다.
+1. api env `STOCKOPS_AI_SERVICE_URL` 미설정 → 기본값 `localhost:8000`으로 자기 자신을 찔러 실패 → statistical 모델로 조용히 폴백.
+2. ai env `DATABASE_URL` 미설정 → ai가 RDS를 직접 조회(psycopg2)하는데 접속 불가 → `/predict` 500.
+3. 데이터 부재 → generate가 보는 건 `outbounds` raw가 아니라 **`analytics.daily_demand_history` 집계 테이블**. 이 테이블이 비어 대상이 0건 → 모델을 한 번도 호출하지 않음.
+
+**해결**:
+- 김진우가 api Deployment에 `STOCKOPS_AI_SERVICE_URL=http://stockops-ai-svc.stockops:8000`, ai Deployment에 `DATABASE_URL`(stockops-secret 참조) 주입.
+- `analytics.daily_demand_history`에 (product/center/warehouse=1) 15일치 시드 INSERT. (ai 예측은 최소 14일 이력 필요)
+- `generate?model=prophet`로 호출 → api가 ai `/predict` 실제 호출 → X-Ray 화살표 생성 (#15).
+
+> ai 응답은 현재 422(api가 보내는 요청 바디 `product_id`/`days` 직렬화 이슈). 이는 앱(현수님) 영역이며, 호출·추적 연결 자체는 정상이다. 직렬화가 고쳐지면 ai 예측 성공 + 🤖 메트릭 패널 값까지 채워진다.
+
+**교훈**: "응답 200"이 "정상 동작"을 보장하지 않는다. AI 연동은 ① 호출 주소(env) ② ai의 DB 접근(env) ③ 예측 재료(집계 데이터) 세 가지가 모두 있어야 실제 호출이 일어난다. 관측(추적/메트릭)이 이 빈 구멍을 정확히 드러냈다.

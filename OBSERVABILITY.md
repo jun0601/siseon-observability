@@ -188,12 +188,14 @@ EKS (seoul-cluster) / stockops 네임스페이스
         Grafana (CloudWatch 데이터소스)  ← siseon-infra-monitoring
 ```
 
+> **멀티리전 확장**: 동일 구조를 오하이오(ohio-cluster, us-east-2)에도 배포해 두 리전 로그를 수집한다. `app_logging` 모듈을 리전 중립화(region/role 변수화)하여 서울·오하이오가 같은 모듈을 재사용하며, 서울 Grafana의 리전 드롭다운 하나로 양쪽 로그를 전환 조회한다. (아래 "멀티리전 로그 수집" 참고)
+
 ## 📜 수집 대상 및 설계 의도
 
-| 서비스 | 로그그룹 | 비고 |
+| 서비스 | 로그그룹 (서울 / 오하이오) | 비고 |
 |--------|---------|------|
-| stockops-api (Spring) | `/aws/eks/seoul-cluster/stockops/api` | API 요청/처리 로그 |
-| stockops-ai (FastAPI) | `/aws/eks/seoul-cluster/stockops/ai` | 예측 서비스 로그 (Bedrock 도입 후 확장) |
+| stockops-api (Spring) | `/aws/eks/seoul-cluster/stockops/api` · `/aws/eks/ohio-cluster/stockops/api` | API 요청/처리 로그 |
+| stockops-ai (FastAPI) | `/aws/eks/seoul-cluster/stockops/ai` · `/aws/eks/ohio-cluster/stockops/ai` | 예측 서비스 로그 |
 
 - **수집 대상 한정**: web 파드는 S3 정적 호스팅으로 이전 예정이라 제외. redis도 제외. 백엔드(api/ai)만 수집해 관측 대상을 명확히 함.
 - **로그그룹 분리**: 서비스별로 로그그룹을 나눠 api 로그와 ai 로그를 독립적으로 조회·분석. Fluent Bit이 `app` 라벨 기반으로 stream을 분리 전송.
@@ -223,6 +225,37 @@ policy = jsonencode({
 ```
 
 > 권한을 `/stockops/*` 로그그룹으로 한정해 최소 권한 원칙 적용.
+
+## 🌐 멀티리전 로그 수집 (서울 + 오하이오)
+
+서울(`seoul-cluster`, ap-northeast-2)과 오하이오(`ohio-cluster`, us-east-2) 두 리전의 앱 로그를 모두 수집해 **단일 Grafana**에서 통합 조회한다.
+
+### 모듈 리전 중립화
+
+`app_logging` 모듈에 하드코딩돼 있던 리전/리소스 이름을 변수로 빼서 서울·오하이오가 같은 모듈을 재사용한다. 서울은 기본값을 그대로 써 기존과 동일하게 동작한다.
+
+| 변수 | 서울(기본값) | 오하이오 |
+|------|-------------|---------|
+| `region` | `ap-northeast-2` | `us-east-2` |
+| `fluentbit_role_name` | `seoul-fluentbit-role` | `ohio-fluentbit-role` |
+| 로그그룹 | `/aws/eks/seoul-cluster/...` | `/aws/eks/ohio-cluster/...` |
+
+> IAM Role은 글로벌 네임스페이스라 이름이 같으면 충돌하므로 리전별로 분리(`seoul-`/`ohio-`)했다.
+
+### Provider 구성
+
+오하이오 리소스는 `aws`/`helm`/`kubernetes` provider의 `ohio` alias(us-east-2)로 생성한다. `main.tf`에서 `module "app_logging_ohio"`를 추가 호출하며 alias provider를 전달하고, 오하이오 클러스터 OIDC issuer를 data source에서 추출한다. (오하이오 OIDC provider는 IAM에 이미 등록돼 IRSA 동작)
+
+### 단일 Grafana 리전 전환
+
+서울 Grafana 로그 대시보드에 **리전 드롭다운 1개**(🌐)를 두고, Grafana 커스텀 변수의 값(`${var}`=리전)과 표시 라벨(`${var:text}`=클러스터명)을 동시에 활용해 리전과 로그그룹 경로를 한 번에 전환한다.
+
+- 서울 선택 → region `ap-northeast-2` + `/aws/eks/seoul-cluster/stockops/...`
+- 오하이오 선택 → region `us-east-2` + `/aws/eks/ohio-cluster/stockops/...`
+
+CloudWatch 데이터소스 하나로 두 리전을 모두 읽는다(데이터소스의 region 필드로 결정). 정적 커스텀 변수라 hidden 변수 없이 첫 로드에 바로 초기화된다.
+
+> **메트릭/추적의 멀티리전**: 로그(CloudWatch)는 AWS 관리형이라 서울 Grafana가 us-east-2를 바로 읽지만, 메트릭(Prometheus)은 오하이오에 별도 Prometheus가 필요해 현재는 리전 전환 UI만 두고 확장 가능하도록 설계했다(오하이오 Prometheus/ADOT 추가 시 즉시 연동).
 
 ## 📌 로그 포맷 참고
 
@@ -297,11 +330,13 @@ Collector를 깐 뒤, 앱 파드(김진우 인프라 레포의 Deployment)에 OT
 
 > 형식 차이 주의: Spring(micrometer)은 traces 전체 경로(`/v1/traces`)를 받고, FastAPI(OTel SDK)는 베이스 주소만 받아 SDK가 경로를 자동으로 붙인다.
 
-## 📌 추적 범위와 한계
+## 📌 추적 범위와 검증
 
 - **단일 서비스 추적**: 모든 api 요청(재고/상품/출고 등 CRUD)은 X-Ray에 기록되어, 각 요청이 보안 필터 → 컨트롤러 → DB → 응답 구간에서 각각 몇 ms를 쓰는지 waterfall로 분석할 수 있다.
-- **서비스 간(분산) 추적**: StockOps는 모놀리식 구조라 서비스를 넘나드는 호출이 **AI 예측 경로(api → ai-module)** 가 유일하다. 따라서 Trace Map에서 서비스 간 연결선은 AI 추천 기능이 동작할 때만 생긴다. 그 외 요청은 단일 서비스 내부 추적으로 기록되는 것이 정상이다.
-- AI 모듈이 완성되어 api가 ai를 실제 호출하면, 동일 trace에 ai 세그먼트가 traceparent 전파로 자동 연결되도록 인프라(Collector)는 준비돼 있다.
+- **서비스 간(분산) 추적 — 검증 완료 ✅**: StockOps는 모놀리식 구조라 서비스를 넘나드는 호출이 **AI 예측 경로(api → ai-module)** 가 유일하다. AI 추천 생성(`POST /api/v1/ai/recommendations/generate?model=prophet`)을 실제로 호출하면 api가 ai-module의 `/predict`를 부르고, **X-Ray Trace Map에 `클라이언트 → stockops → stockops-ai-module` 화살표가 생성**된다. traceparent 헤더가 서비스 경계를 넘어 전파되어 하나의 trace로 자동 연결된다.
+- **Waterfall 분석**: 개별 trace에서 보안 필터체인(247ms) → 권한 검증 → prophet 예측 연산 → ai-module 원격 호출까지 구간별 소요 시간이 그대로 보인다. ai 호출 실패 시 통계 기반 모델(`statistical-compute`)로 자동 폴백하는 graceful degradation도 추적에 드러난다.
+
+> 검증을 위해 RDS에 상품 + `analytics.daily_demand_history` 수요 이력(15일치)을 적재하고 generate API를 호출했다. api↔ai 연동을 위해 api에 `STOCKOPS_AI_SERVICE_URL`, ai에 `DATABASE_URL` 환경변수 주입이 선행됐다. (현재 api의 ai 요청 바디 직렬화 이슈로 ai가 422를 반환하지만, 호출·추적 연결 자체는 정상 동작하며 직렬화 수정은 앱(현수님) 영역이다.)
 
 ---
 
@@ -311,8 +346,8 @@ Collector를 깐 뒤, 앱 파드(김진우 인프라 레포의 Deployment)에 OT
 |------|------|-----------|--------------|------|
 | IoT 센서 | IoT Core → Firehose → S3 → Athena | S3 | Athena | ✅ 완료 |
 | 애플리케이션 로그 | stdout → Fluent Bit → CloudWatch Logs | CloudWatch | CloudWatch | ✅ 완료 |
-| 애플리케이션 메트릭 | `/actuator/prometheus` → ServiceMonitor → Prometheus | Prometheus | Prometheus | ✅ 완료 (api) |
-| 분산 추적 | OTel SDK → ADOT Collector → X-Ray | AWS X-Ray | X-Ray | ✅ 완료 |
+| 애플리케이션 메트릭 | api `/actuator/prometheus` · ai `/metrics` → ServiceMonitor → Prometheus | Prometheus | Prometheus | ✅ 완료 (api + ai) |
+| 분산 추적 | OTel SDK → ADOT Collector → X-Ray (api→ai 화살표 검증) | AWS X-Ray | X-Ray | ✅ 완료 |
 | Bedrock 사용량 | Bedrock → CloudWatch(AWS/Bedrock) → Grafana | CloudWatch | CloudWatch | ⬜ Bedrock 활성화 후 |
 
-> 메트릭은 api(Spring actuator)만 수집한다. ai(FastAPI)는 `/metrics`가 없어 메트릭 대신 분산 추적으로 관측하기로 역할을 분리했다. 분산 추적은 X-Ray SDK 대신 OpenTelemetry(OTel) 기반으로 구성했다 — X-Ray SDK가 유지보수 모드로 전환되는 추세이고, OTel Collector를 통해 백엔드(X-Ray/Tempo/Jaeger) 교체 유연성을 확보하기 위함. 계측(앱 SDK)은 현수님 영역, Collector 배포는 본 레포 영역으로 분리했다.
+> 메트릭은 api(Spring actuator, `/actuator/prometheus`)와 ai(FastAPI, `/metrics` — prometheus-fastapi-instrumentator) **양쪽 모두** 수집한다. ai는 예측 요청 처리량·지연 p95(histogram)·모델 캐시 적중률·MAPE 같은 비즈니스 메트릭을 노출한다. (초기엔 ai에 `/metrics`가 없어 추적으로만 관측했으나, 앱 업데이트로 메트릭 엔드포인트가 추가되어 ServiceMonitor를 부활시켰다.) 분산 추적은 X-Ray SDK 대신 OpenTelemetry(OTel) 기반으로 구성했다 — X-Ray SDK가 유지보수 모드로 전환되는 추세이고, OTel Collector를 통해 백엔드(X-Ray/Tempo/Jaeger) 교체 유연성을 확보하기 위함. 계측(앱 SDK)은 현수님 영역, Collector 배포는 본 레포 영역으로 분리했다.
