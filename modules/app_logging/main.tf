@@ -15,7 +15,7 @@ resource "aws_cloudwatch_log_group" "ai" {
 # 2. Fluent Bit IRSA Role
 # ─────────────────────────────────────────────
 resource "aws_iam_role" "fluentbit" {
-  name = "seoul-fluentbit-role"
+  name = var.fluentbit_role_name
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -48,7 +48,7 @@ resource "aws_iam_role_policy" "fluentbit" {
         "logs:DescribeLogStreams",
         "logs:DescribeLogGroups"
       ]
-      Resource = "arn:aws:logs:ap-northeast-2:${var.aws_account_id}:log-group:/aws/eks/${var.cluster_name}/stockops/*"
+      Resource = "arn:aws:logs:${var.region}:${var.aws_account_id}:log-group:/aws/eks/${var.cluster_name}/stockops/*"
     }]
   })
 }
@@ -86,7 +86,7 @@ resource "helm_release" "fluentbit" {
           path = "/api/v1/health"
           port = 2020
         }
-      }  
+      }
       serviceAccount = {
         create = true
         name   = "fluent-bit"
@@ -141,7 +141,7 @@ resource "helm_release" "fluentbit" {
           [OUTPUT]
               Name cloudwatch_logs
               Match stockops.api.*
-              region ap-northeast-2
+              region ${var.region}
               log_group_name /aws/eks/${var.cluster_name}/stockops/api
               log_stream_prefix api-
               auto_create_group false
@@ -149,7 +149,7 @@ resource "helm_release" "fluentbit" {
           [OUTPUT]
               Name cloudwatch_logs
               Match stockops.ai.*
-              region ap-northeast-2
+              region ${var.region}
               log_group_name /aws/eks/${var.cluster_name}/stockops/ai
               log_stream_prefix ai-
               auto_create_group false

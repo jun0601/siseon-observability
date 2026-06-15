@@ -20,8 +20,25 @@ module "app_logging" {
   eks_oidc_issuer = local.eks_oidc_issuer
 }
 
+module "app_logging_ohio" {
+  source = "./modules/app_logging"
+
+  providers = {
+    aws        = aws.ohio
+    helm       = helm.ohio
+    kubernetes = kubernetes.ohio
+  }
+
+  cluster_name        = var.ohio_cluster_name
+  aws_account_id      = var.aws_account_id
+  eks_oidc_issuer     = local.ohio_eks_oidc_issuer
+  region              = "us-east-2"
+  fluentbit_role_name = "ohio-fluentbit-role"
+}
+
 locals {
-  eks_oidc_issuer = replace(data.aws_eks_cluster.this.identity[0].oidc[0].issuer, "https://", "")
+  eks_oidc_issuer      = replace(data.aws_eks_cluster.this.identity[0].oidc[0].issuer, "https://", "")
+  ohio_eks_oidc_issuer = replace(data.aws_eks_cluster.ohio.identity[0].oidc[0].issuer, "https://", "")
 }
 
 module "tracing" {
