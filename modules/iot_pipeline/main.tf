@@ -6,7 +6,7 @@ resource "aws_s3_bucket" "query_results" {
 
 # Athena 워크그룹
 resource "aws_athena_workgroup" "sensor" {
-  name = var.athena_workgroup_name
+  name          = var.athena_workgroup_name
   force_destroy = true
 
   configuration {
@@ -29,16 +29,16 @@ resource "aws_glue_catalog_table" "sensor_data" {
   table_type = "EXTERNAL_TABLE"
 
   parameters = {
-    "classification"         = "json"
-    "projection.enabled"     = "true"
-    "projection.year.type"   = "integer"
-    "projection.year.range"  = "2026,2030"
-    "projection.month.type"  = "integer"
-    "projection.month.range" = "1,12"
-    "projection.month.digits" = "2"
-    "projection.day.type"    = "integer"
-    "projection.day.range"   = "1,31"
-    "projection.day.digits"  = "2"
+    "classification"            = "json"
+    "projection.enabled"        = "true"
+    "projection.year.type"      = "integer"
+    "projection.year.range"     = "2026,2030"
+    "projection.month.type"     = "integer"
+    "projection.month.range"    = "1,12"
+    "projection.month.digits"   = "2"
+    "projection.day.type"       = "integer"
+    "projection.day.range"      = "1,31"
+    "projection.day.digits"     = "2"
     "storage.location.template" = "s3://${var.sensor_bucket_name}/sensors/year=$${year}/month=$${month}/day=$${day}/"
   }
 

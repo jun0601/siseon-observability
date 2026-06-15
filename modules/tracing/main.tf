@@ -48,7 +48,7 @@ resource "helm_release" "adot_collector" {
 
   values = [
     yamlencode({
-      mode  = "deployment"
+      mode = "deployment"
       image = {
         repository = "public.ecr.aws/aws-observability/aws-otel-collector"
         tag        = "v0.41.1"
